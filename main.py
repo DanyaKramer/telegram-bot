@@ -4,25 +4,15 @@ import telebot
 import config
 from telebot import types
 import logging as loger
-from datetime import datetime
-
-loger.basicConfig(filename='Bot_Errs.log', level=loger.ERROR)
-
-#check_lessons = datetime.time(18, 0, 0)
-
-sf_sticker_id = 'CAACAgIAAxkBAAIBXWe5tajRZf78MwYVP5P8stp12RZvAALJVwACoWHpS6EShjjI1IcoNgQ'
-
+from datetime import time, datetime
 
 bot = telebot.TeleBot(config.token)
-
 
 
 @bot.message_handler(commands=['start'])
 def start(message):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn1 = types.KeyboardButton("Изменения в расписании")
-    
-
     markup.add(btn1)
     bot.send_message(message.chat.id, text="Привет, {0.first_name}! Я бот который покажет тебе расписание и измениения в нём.".format(message.from_user), reply_markup=markup)
 
@@ -79,6 +69,9 @@ def parsing_dates():
     return date
         
         
+if __name__ == "__main__":
 
-
-bot.polling(none_stop=True, interval=0)
+    check_lessons = time(18, 0, 0)
+    sf_sticker_id = 'CAACAgIAAxkBAAIBXWe5tajRZf78MwYVP5P8stp12RZvAALJVwACoWHpS6EShjjI1IcoNgQ'
+    
+    bot.polling(none_stop=True, interval=0)
