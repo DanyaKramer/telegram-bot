@@ -1,3 +1,4 @@
+APScheduler==3.11.0
 beautifulsoup4==4.13.3
 bs4==0.0.2
 certifi==2025.1.31
@@ -11,5 +12,7 @@ requests==2.32.3
 soupsieve==2.6
 telebot==0.0.5
 typing_extensions==4.12.2
+tzdata==2025.1
+tzlocal==5.3
 urllib3==2.3.0
 yarg==0.1.10
