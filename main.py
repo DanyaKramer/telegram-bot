@@ -4,10 +4,11 @@ import telebot
 import config
 from telebot import types
 import logging as loger
-
+from datetime import datetime
 
 loger.basicConfig(filename='Bot_Errs.log', level=loger.ERROR)
 
+#check_lessons = datetime.time(18, 0, 0)
 
 sf_sticker_id = 'CAACAgIAAxkBAAIBXWe5tajRZf78MwYVP5P8stp12RZvAALJVwACoWHpS6EShjjI1IcoNgQ'
 
@@ -47,14 +48,11 @@ def get_text_messages(message):
 
         if message.text == "Изменения в расписании":
             try:
+               bot.send_message(message.from_user.id, parsing_dates())
                bot.send_message(message.from_user.id, parsing_lessons())
             except telebot.apihelper.ApiTelegramException as e:
                 if "message text is empty" in str(e):
                     bot.send_message(message.from_user.id, "Возможно замен нет")
-                 
-        elif message.text == "Она че то делает, но не работает":
-             bot.send_message(message.from_user.id, "Долбоеб написано же что не работает")
-
 
 
 def parsing_lessons():
@@ -64,7 +62,6 @@ def parsing_lessons():
     soup = BeautifulSoup(req, 'lxml')
     
     target_text = "СА-1-23"
-
     groups = soup.find_all('div', class_='table-responsive')
     for group in groups:
         table = group.find('table')
@@ -73,6 +70,15 @@ def parsing_lessons():
             lessons = table.get_text()
             print(lessons)
             return lessons
+def parsing_dates():
+    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/').text
+    
+    soup = BeautifulSoup(req, 'lxml')
+    date = soup.find('h4').text
+    print(date)
+    return date
+        
+        
 
 
 bot.polling(none_stop=True, interval=0)
