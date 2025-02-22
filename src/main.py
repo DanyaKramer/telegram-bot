@@ -1,7 +1,7 @@
 import requests
 from bs4 import BeautifulSoup
 import telebot
-import config
+import config as config
 from telebot import types
 
 
