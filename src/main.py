@@ -3,11 +3,28 @@ from bs4 import BeautifulSoup
 import telebot
 import config as config
 from telebot import types
-from datetime import time, datetime
 from apscheduler.schedulers.background import BackgroundScheduler
+import json 
 
+
+task = BackgroundScheduler()
 bot = telebot.TeleBot(config.token) # в файле config.py содержится API ключ для работы бота
-scheduler = BackgroundScheduler()
+users = set()
+
+def save_users():
+    with open('users.json', "w", encoding="utf-8") as f:
+        json.dump(list(users), f)
+def load_users():
+    global users
+    try: 
+        with open("users.json", "r", encoding="utf-8") as f:
+            users = set(json.load(f))
+    except FileNotFoundError:
+        users = set()
+
+
+
+
 
 # распознавание стикеров
 @bot.message_handler(content_types='sticker')
@@ -19,35 +36,40 @@ def stikers_message(message):
 # приветственное сообщение
 @bot.message_handler(commands=['start'])
 def start(message):
+    users.add(message.chat.id)
+    save_users()
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     btn1 = types.KeyboardButton("Изменения в расписании")
     markup.add(btn1)
-    bot.send_message(message.chat.id, text="Привет, {0.first_name}! Я бот который покажет тебе расписание и измениения в нём.".format(message.from_user), reply_markup=markup)
+    bot.send_message(message.chat.id, text="Привет, {0.first_name}! Я бот который покажет тебе расписание и изменения в нём.".format(message.from_user), reply_markup=markup)
 
-@bot.message_handler(content_types='text') # контент который бот понимает 
+
+
+@bot.message_handler(content_types=['text']) # контент который бот понимает 
 def get_replacements_message(message):
 
         if message.text == "Изменения в расписании": # просмотр замен 
             try:
-               bot.send_message(message.from_user.id, f"{parsing_dates()}\n" + f"{get_replacements()}")
+               bot.send_message(message.chat.id, f"{parsing_dates()}\n" + f"{get_replacements()}")
             except telebot.apihelper.ApiTelegramException as e: # если замен нету, то сообщение будет пустым и в результает выскочит ошибка, чтобы этого избежать используется данная строка
                 if "message text is empty" in str(e):
-                    bot.send_message(message.from_user.id, "Возможно замен нет")
+                    bot.send_message(message.chat.id, "Возможно замен нет")
+                    
 
 @bot.message_handler(content_types='text')
 def easterEgg(message):
 
-    if message.text == "сосал?": #пасхалко
+    if message.text in "сосал?": #пасхалко
             markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
             btnYes = types.KeyboardButton("Да")
             btnNo = types.KeyboardButton("Нет")
             back = types.KeyboardButton("Обратно к расписанию")
             markup.add(btnYes, btnNo, back)
-            bot.send_message(message.from_user.id, "А ты?", reply_markup=markup)
+            bot.send_message(message.chat.id, "А ты?", reply_markup=markup)
     elif message.text == "Обратно к расписанию":
             start(message)
     elif message.text == "Да": 
-            bot.send_sticker(message.from_user.id, sf_sticker_id)
+            bot.send_sticker(message.chat.id, sf_sticker_id)
     elif message.text == "Нет":
          bot.reply_to(message, "Ну нет так нет")
 
@@ -100,14 +122,61 @@ def check_replasements(message):
      elif get_replacements() == "Возможно замен нет":
         pass
 
-scheduler.add_job(check_replasements, 'cron', hour=15, minute=20)
-scheduler.add_job(check_replasements, 'cron', hour=17, minute=20)
-scheduler.add_job(check_replasements, 'cron', hour=19, minute=20)
-scheduler.start()
+
+def save_data(data, filename="last_data.json"):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+def load_data(filename="last_data.json"):
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+# Проверка изменений
+def check_changes():
+    current_data = get_replacements()
+    last_data = load_data()
+
+    if last_data is None:
+        save_data(current_data)
+        return False
+
+    if current_data != last_data:
+        save_data(current_data)
+        return True
+    return False
+
+
+# Уведомление
+def send_notification():
+    if check_changes():
+        changes = get_replacements()
+        for user_id in users:
+            try:
+                bot.send_message(user_id, f"Обновление в расписании:\n{changes}")
+            except telebot.apihelper.ApiTelegramException as e:
+                print(f"Ошибка отправки пользователю {user_id}")
+
+
+# Защищенный вызов
+def safe_send_notification():
+    try:
+        send_notification()
+        print('проверка расписания')
+    except Exception as e:
+        print(f"Ошибка: {e}")
+
+# Планировщик
+task.add_job(safe_send_notification, 'interval', minutes=1)
+
+task.start()
+
 
 if __name__ == "__main__":
 
-    chat_id = 6007204044
+    load_users()
     sf_sticker_id = 'CAACAgIAAxkBAAIBXWe5tajRZf78MwYVP5P8stp12RZvAALJVwACoWHpS6EShjjI1IcoNgQ' # это просто id стикера для работы пасхалки
     bot.polling(none_stop=True, interval=0) # поддержка работоспособности скрипта
     
