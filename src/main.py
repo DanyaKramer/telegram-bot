@@ -155,7 +155,7 @@ def send_notification():
         changes = get_replacements()
         for user_id in users:
             try:
-                bot.send_message(user_id, f"Обновление в расписании:\n{changes}")
+                bot.send_message(user_id, f"Обновление в расписании на завтра :\n{changes}")
             except telebot.apihelper.ApiTelegramException as e:
                 print(f"Ошибка отправки пользователю {user_id}")
 
@@ -169,8 +169,7 @@ def safe_send_notification():
         print(f"Ошибка: {e}")
 
 # Планировщик
-task.add_job(safe_send_notification, 'interval', minutes=1)
-
+task.add_job(safe_send_notification, 'interval', minutes=20)
 task.start()
 
 
