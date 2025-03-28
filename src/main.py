@@ -26,13 +26,6 @@ def load_users():
 
 
 
-# распознавание стикеров
-@bot.message_handler(content_types='sticker')
-def stikers_message(message):
-                   
-     sticker_id = message.sticker.file_id
-     bot.reply_to(message, f"ID стикера: {sticker_id}")
-        
 # приветственное сообщение
 @bot.message_handler(commands=['start'])
 def start(message):
@@ -55,23 +48,6 @@ def get_replacements_message(message):
                 if "message text is empty" in str(e):
                     bot.send_message(message.chat.id, "Возможно замен нет")
                     
-
-@bot.message_handler(content_types='text')
-def easterEgg(message):
-
-    if message.text in "сосал?": #пасхалко
-            markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            btnYes = types.KeyboardButton("Да")
-            btnNo = types.KeyboardButton("Нет")
-            back = types.KeyboardButton("Обратно к расписанию")
-            markup.add(btnYes, btnNo, back)
-            bot.send_message(message.chat.id, "А ты?", reply_markup=markup)
-    elif message.text == "Обратно к расписанию":
-            start(message)
-    elif message.text == "Да": 
-            bot.send_sticker(message.chat.id, sf_sticker_id)
-    elif message.text == "Нет":
-         bot.reply_to(message, "Ну нет так нет")
 
 
 def get_replacements():
