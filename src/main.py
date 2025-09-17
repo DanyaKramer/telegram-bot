@@ -4,154 +4,141 @@ import telebot
 import config as config
 from telebot import types
 from apscheduler.schedulers.background import BackgroundScheduler
-import json 
+import json
 
-
+# --- Глобальные переменные ---
 task = BackgroundScheduler()
-bot = telebot.TeleBot(config.token) # в файле config.py содержится API ключ для работы бота
+bot = telebot.TeleBot(config.token)
 users = set()
 
+# Кэш для быстрых ответов
+cache = {"date": "Дата не загружена", "replacements": "Данных пока нет"}
+
+
+# --- Работа с пользователями ---
 def save_users():
     with open('users.json', "w", encoding="utf-8") as f:
         json.dump(list(users), f)
+
+
 def load_users():
     global users
-    try: 
+    try:
         with open("users.json", "r", encoding="utf-8") as f:
             users = set(json.load(f))
     except FileNotFoundError:
         users = set()
 
 
+# --- Загрузка и парсинг страницы ---
+def fetch_page():
+    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/').text
+    return BeautifulSoup(req, 'lxml')
 
 
+def get_replacements(soup, target_text="СА-1-23"):
+    """Ищем замены по конкретной группе"""
+    groups = soup.find_all('div', class_='table-responsive')
+    result = []
 
-# приветственное сообщение
+    for group in groups:
+        if target_text.lower() in group.text.lower():
+            table = group.find('table')
+            if not table:
+                continue
+
+            rows = table.find_all('tr')
+            for row in rows:
+                cells = row.find_all('td')
+                if len(cells) >= 4:
+                    lesson = cells[0].text.strip()
+                    replaced = cells[1].text.strip()
+                    replacement = cells[2].text.strip()
+                    added = cells[3].text.strip()
+
+                    formatted_message = (
+                        f"Пара: {lesson}\n"
+                        f"Что заменяют: {replaced}\n"
+                        f"На что заменяют: {replacement}\n"
+                        f"Добавлена: {added}\n"
+                    )
+                    result.append(formatted_message)
+
+    return "\n".join(result) if result else "Возможно замен нет"
+
+
+def parsing_dates(soup):
+    """Возвращаем дату изменений"""
+    date_tag = soup.find('h4')
+    return date_tag.text.strip() if date_tag else "Дата не найдена"
+
+
+# --- Обновление кэша ---
+def update_cache():
+    global cache
+    try:
+        soup = fetch_page()
+        cache["date"] = parsing_dates(soup)
+        cache["replacements"] = get_replacements(soup)
+        print("Кэш обновлён")
+    except Exception as e:
+        print(f"Ошибка обновления кэша: {e}")
+
+
+# --- Хэндлеры бота ---
 @bot.message_handler(commands=['start'])
 def start(message):
     users.add(message.chat.id)
     save_users()
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn1 = types.KeyboardButton("Изменения в расписании")
-    markup.add(btn1)
-    bot.send_message(message.chat.id, text="Привет, {0.first_name}! Я бот который покажет тебе расписание и изменения в нём.".format(message.from_user), reply_markup=markup)
+    markup.add(types.KeyboardButton("Изменения в расписании"))
+    bot.send_message(
+        message.chat.id,
+        text=f"Привет, {message.from_user.first_name}! "
+             f"Я бот, который покажет тебе расписание и изменения в нём.",
+        reply_markup=markup
+    )
 
 
-
-@bot.message_handler(content_types=['text']) # контент который бот понимает 
-def get_replacements_message(message):
-
-        if message.text == "Изменения в расписании": # просмотр замен 
-            try:
-               bot.send_message(message.chat.id, f"{parsing_dates()}\n" + f"{get_replacements()}")
-            except telebot.apihelper.ApiTelegramException as e: # если замен нету, то сообщение будет пустым и в результает выскочит ошибка, чтобы этого избежать используется данная строка
-                if "message text is empty" in str(e):
-                    bot.send_message(message.chat.id, "Возможно замен нет")
-                    
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    if message.text == "Изменения в расписании":
+        bot.send_message(message.chat.id, f"{cache['date']}\n{cache['replacements']}")
 
 
-def get_replacements():
-        
-    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/').text #создание запроса на получение html страницы
-    soup = BeautifulSoup(req, 'lxml') # парсинг страницы
-    target_text = "СА-1-23" # целевая группа для парсинга
-    groups = soup.find_all('div', class_='table-responsive') # находит все таблицы 
-    result = [] # сюда запишется текст с заменами
-    
-    for group in groups:
-        table = group.find('table') # в найденных div находит table 
-        table_text = table.get_text().lower() # запись имени таблицы в переменную
-        if target_text.lower() in table_text: # проверка наличия целевой группы в таблице
-            rows = table.find_all('tr') # выборка всех строк для дальнейшего форматирования
-            for row in rows: # перебор всех строк для выборки всех ячеек
-                cells = row.find_all('td') #
-                if len(cells) >= 4: # проверка на количество ячеек, оно дол
-                    lesson = cells[0].text.strip() # первая найденная ячейка в строке отвечает за номер пары
-                    replaced = cells[1].text.strip() # вторая ячейка отвечает за наименование заменяемой пары 
-                    replacement = cells[2].text.strip() # третья ячейка отвечает за наименование пары на какую меняют
-                    added = cells[3].text.strip() # четвертая ячейка отвечает за дату и время когда была добавлена замена
-
-                    formatted_message = ( # после полученных данных сообщение форматируется для последующей обработки
-                        f"Пара: {lesson}\n"
-                        f"Что заменяют: {replaced}\n"
-                        f"На что заменяют: {replacement}\n"
-                        f"Добавлена: {added}\n"
-                    ) 
-                    result.append(formatted_message) # форматированное сообщение добавляется в список
-    if result: # проверка списка на наличие предметов в нём
-        return "\n".join(result) # если  в списке имеются предметы, тогда функция возвращает result подсоединяя каждый предмет с новой строки
-    else: # в других случаях возвращает сообщение об отсутствии замен 
-        return "Возможно замен нет"
-        
-def parsing_dates():
-
-    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/').text #создание запроса на получение html страницы
-    soup = BeautifulSoup(req, 'lxml') # парсинг страницы
-    date = soup.find('h4').text #поиск даты для дальнейшей обработки
-    return date
-
-@bot.message_handler(content_types='text')
-def check_replasements(message):
-     get_replacements()
-     if get_replacements() != "Возможно замен нет":
-          bot.send_message(message.chat.id, get_replacements)
-     elif get_replacements() == "Возможно замен нет":
-        pass
+# --- Проверка изменений и уведомления ---
+last_sent_data = None
 
 
-def save_data(data, filename="last_data.json"):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(data, f)
-
-def load_data(filename="last_data.json"):
-    try:
-        with open(filename, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-
-# Проверка изменений
-def check_changes():
-    current_data = get_replacements()
-    last_data = load_data()
-
-    if last_data is None:
-        save_data(current_data)
-        return False
-
-    if current_data != last_data:
-        save_data(current_data)
-        return True
-    return False
-
-
-# Уведомление
 def send_notification():
-    if check_changes():
-        changes = get_replacements()
+    global last_sent_data
+    if cache["replacements"] != last_sent_data:
+        last_sent_data = cache["replacements"]
         for user_id in users:
             try:
-                bot.send_message(user_id, f"Обновление в расписании на завтра :\n{changes}")
-            except telebot.apihelper.ApiTelegramException as e:
+                bot.send_message(user_id, f"Обновление в расписании:\n{cache['replacements']}")
+            except telebot.apihelper.ApiTelegramException:
                 print(f"Ошибка отправки пользователю {user_id}")
 
 
-# Защищенный вызов
-def safe_send_notification():
+def safe_send():
     try:
+        update_cache()
         send_notification()
-        print('проверка расписания')
+        print("Проверка завершена")
     except Exception as e:
         print(f"Ошибка: {e}")
 
-# Планировщик
-task.add_job(safe_send_notification, 'interval', minutes=20)
+
+# --- Планировщик ---
+task.add_job(safe_send, 'interval', minutes=20)
 task.start()
 
+# Первое обновление сразу
+update_cache()
 
+# --- Запуск бота ---
 if __name__ == "__main__":
-
     load_users()
-    sf_sticker_id = 'CAACAgIAAxkBAAIBXWe5tajRZf78MwYVP5P8stp12RZvAALJVwACoWHpS6EShjjI1IcoNgQ' # это просто id стикера для работы пасхалки
-    bot.polling(none_stop=True, interval=0) # поддержка работоспособности скрипта
-    
+    bot.polling(none_stop=True, interval=1)
+
