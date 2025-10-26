@@ -19,7 +19,7 @@ ADMIN_ID = 6007204044
 cache = {"date": "Дата не загружена", "replacements": "Данных пока нет"}
 
 logging.basicConfig(
-    filename="bot_errors.log",
+    filename="/app/logs/bot_errors.log",
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
