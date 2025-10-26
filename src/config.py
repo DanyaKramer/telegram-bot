@@ -1,2 +1,1 @@
-token = '8150173218:AAE7SNAuRxkOwHZcB_RxDb1CnvHpNeKkgWA'
-#
+token = '6932161074:AAFDiVeWgRFHWfJroqSd9-RINsgYTrrzZKc'
