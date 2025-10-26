@@ -16,7 +16,7 @@ from datetime import datetime
 task = BackgroundScheduler()
 bot = telebot.TeleBot(config.token)
 users = set()
-ADMIN_ID = 6007204044
+
 # Кэш для быстрых ответов
 cache = {"date": "Дата не загружена", "replacements": "Данных пока нет"}
 
