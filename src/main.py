@@ -5,14 +5,24 @@ import config as config
 from telebot import types
 from apscheduler.schedulers.background import BackgroundScheduler
 import json
+import logging
+import traceback
+import time
+from telebot import apihelper
 
 # --- Глобальные переменные ---
 task = BackgroundScheduler()
 bot = telebot.TeleBot(config.token)
 users = set()
-
+ADMIN_ID = 6007204044
 # Кэш для быстрых ответов
 cache = {"date": "Дата не загружена", "replacements": "Данных пока нет"}
+
+logging.basicConfig(
+    filename="bot_errors.log",
+    level=logging.ERROR,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 
 # --- Работа с пользователями ---
@@ -140,5 +150,25 @@ update_cache()
 # --- Запуск бота ---
 if __name__ == "__main__":
     load_users()
-    bot.polling(none_stop=True, interval=1)
+    try:
+        print("Бот запущен...")
+        bot.polling(none_stop=True, interval=1, timeout=30)
+    except Exception as e:
+        # логируем в файл
+        error_text = traceback.format_exc()
+        logging.error("Ошибка в polling:\n%s", error_text)
 
+        # уведомляем админа
+        try:
+            bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Бот упал с ошибкой:\n\n<pre>{e}</pre>",
+                parse_mode="HTML",
+            )
+        except Exception:
+            # если бот не может даже отправить сообщение — записываем в лог
+            logging.error("Не удалось уведомить админа:\n%s", traceback.format_exc())
+
+        print(f"Ошибка polling: {e}")
+        print("Бот завершил работу. Docker перезапустит контейнер.")
+        time.sleep(5)  # небольшая пауза перед выходом
