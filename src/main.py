@@ -9,6 +9,8 @@ import logging
 import traceback
 import time
 from telebot import apihelper
+import os
+from datetime import datetime
 
 # --- Глобальные переменные ---
 task = BackgroundScheduler()
@@ -24,6 +26,97 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 
+
+
+# Админское меню
+@bot.message_handler(commands=['admin'])
+def admin_menu(message):
+    if message.chat.id != config.ADMIN_ID:
+        bot.send_message(message.chat.id, "❌ У вас нет прав для этой команды.")
+        return
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(
+        types.KeyboardButton("📊 Список пользователей"),
+        types.KeyboardButton("🔄 Обновить кэш"),
+        types.KeyboardButton("🧹 Очистить пользователей"),
+        types.KeyboardButton("📈 Статистика"),
+        types.KeyboardButton("📂 Скачать лог"),
+        types.KeyboardButton("📢 Рассылка"),
+        types.KeyboardButton("⬅️ Выйти из админ-меню")
+    )
+    bot.send_message(message.chat.id, "⚙️ Админ-меню:", reply_markup=markup)
+
+
+# Обработка кнопок админа
+@bot.message_handler(func=lambda message: message.chat.id == config.ADMIN_ID)
+def admin_commands(message):
+    if message.text == "📊 Список пользователей":
+        if not users:
+            bot.send_message(message.chat.id, "👥 Список пользователей пуст.")
+        else:
+            text = "\n".join(str(uid) for uid in users)
+            bot.send_message(message.chat.id, f"👥 Пользователи ({len(users)}):\n{text}")
+
+    elif message.text == "🔄 Обновить кэш":
+        update_cache()
+        bot.send_message(message.chat.id, "✅ Кэш расписания обновлён вручную.")
+
+    elif message.text == "🧹 Очистить пользователей":
+        users.clear()
+        save_users()
+        bot.send_message(message.chat.id, "🧹 Список пользователей очищен.")
+
+    elif message.text == "📈 Статистика":
+        stats_text = (
+            f"📊 Статистика бота:\n\n"
+            f"👥 Пользователей: {len(users)}\n"
+            f"🕒 Последнее обновление: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            f"🗂 Кэш даты: {cache.get('date', 'нет данных')}\n"
+        )
+        bot.send_message(message.chat.id, stats_text)
+
+    elif message.text == "📂 Скачать лог":
+        log_path = "/app/logs/bot_errors.log"
+        if os.path.exists(log_path):
+            with open(log_path, "rb") as log_file:
+                bot.send_document(message.chat.id, log_file)
+        else:
+            bot.send_message(message.chat.id, "⚠️ Лог-файл не найден.")
+
+    elif message.text == "📢 Рассылка":
+        msg = bot.send_message(message.chat.id, "Введите текст рассылки:")
+        bot.register_next_step_handler(msg, broadcast_message)
+
+    elif message.text == "⬅️ Выйти из админ-меню":
+        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+        markup.add(types.KeyboardButton("Изменения в расписании"))
+        bot.send_message(message.chat.id, "↩️ Возврат в обычное меню.", reply_markup=markup)
+
+
+
+def broadcast_message(message):
+    if message.chat.id != config.ADMIN_ID:
+        bot.send_message(message.chat.id, "❌ У вас нет прав для этой команды.")
+        return
+
+    text = message.text.strip()
+    count = 0
+    failed = 0
+
+    for user_id in users.copy():
+        try:
+            bot.send_message(user_id, f"📢 Сообщение от администратора:\n\n{text}")
+            count += 1
+            time.sleep(0.1)  # защита от flood limit
+        except Exception as e:
+            failed += 1
+            print(f"Ошибка при рассылке пользователю {user_id}: {e}")
+
+    bot.send_message(
+        config.ADMIN_ID,
+        f"✅ Рассылка завершена.\n📨 Успешно: {count}\n⚠️ Ошибок: {failed}"
+    )
 
 # --- Работа с пользователями ---
 def save_users():
