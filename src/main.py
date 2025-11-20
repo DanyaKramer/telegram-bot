@@ -83,6 +83,9 @@ def admin_commands(message):
         )
         bot.send_message(message.chat.id, stats_text)
 
+    elif message.text == "Изменения в расписании":
+        handle_text(message)
+
     elif message.text == "📂 Скачать лог":
         log_path = "/app/logs/bot_errors.log"
         if os.path.exists(log_path):
