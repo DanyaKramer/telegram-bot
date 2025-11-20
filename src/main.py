@@ -11,6 +11,7 @@ import time
 from telebot import apihelper
 import os
 from datetime import datetime
+from requests import exceptions as req_exceptions
 
 # --- Глобальные переменные ---
 task = BackgroundScheduler()
@@ -25,7 +26,13 @@ logging.basicConfig(
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
+logger = logging.getLogger("bot")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    logger.addHandler(console_handler)
 
 
 # Админское меню
@@ -98,6 +105,10 @@ def admin_commands(message):
 def broadcast_message(message):
     if message.chat.id != config.ADMIN_ID:
         bot.send_message(message.chat.id, "❌ У вас нет прав для этой команды.")
+        return
+
+    if not message.text:
+        bot.send_message(message.chat.id, "⚠️ Пустое сообщение — рассылка отменена.")
         return
 
     text = message.text.strip()
@@ -183,9 +194,9 @@ def update_cache():
         soup = fetch_page()
         cache["date"] = parsing_dates(soup)
         cache["replacements"] = get_replacements(soup)
-        print("Кэш обновлён")
+        logger.info("Кэш обновлён: %s", cache["date"])
     except Exception as e:
-        print(f"Ошибка обновления кэша: {e}")
+        logger.error("Ошибка обновления кэша: %s", e, exc_info=True)
 
 
 # --- Хэндлеры бота ---
@@ -228,9 +239,9 @@ def safe_send():
     try:
         update_cache()
         send_notification()
-        print("Проверка завершена")
+        logger.info("Периодическая проверка завершена")
     except Exception as e:
-        print(f"Ошибка: {e}")
+        logger.error("Ошибка фоновой задачи: %s", e, exc_info=True)
 
 
 # --- Планировщик ---
@@ -241,27 +252,44 @@ task.start()
 update_cache()
 
 # --- Запуск бота ---
+def notify_admin(message_text):
+    if not getattr(config, "ADMIN_ID", None):
+        logger.warning("ADMIN_ID не задан, уведомление пропущено.")
+        return
+    try:
+        bot.send_message(
+            config.ADMIN_ID,
+            message_text,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        logging.error("Не удалось уведомить админа:\n%s", traceback.format_exc())
+
+
+def run_polling():
+    delay = 5
+    max_delay = 300
+    while True:
+        try:
+            logger.info("Запуск polling...")
+            bot.polling(none_stop=True, interval=1, timeout=30, long_polling_timeout=30)
+        except (req_exceptions.ReadTimeout, req_exceptions.ConnectTimeout, req_exceptions.ConnectionError) as e:
+            logging.error("Сетевая ошибка в polling:\n%s", traceback.format_exc())
+            notify_admin(f"⚠️ Сетевая ошибка polling:\n\n<pre>{e}</pre>")
+        except Exception as e:
+            logging.error("Неожиданная ошибка в polling:\n%s", traceback.format_exc())
+            notify_admin(f"⚠️ Бот упал с ошибкой:\n\n<pre>{e}</pre>")
+        else:
+            delay = 5
+            continue
+
+        logger.info("Перезапуск polling через %s секунд...", delay)
+        time.sleep(delay)
+        delay = min(delay * 2, max_delay)
+
+
 if __name__ == "__main__":
     load_users()
-    try:
-        print("Бот запущен...")
-        bot.polling(none_stop=True, interval=1, timeout=30)
-    except Exception as e:
-        # логируем в файл
-        error_text = traceback.format_exc()
-        logging.error("Ошибка в polling:\n%s", error_text)
-
-        # уведомляем админа
-        try:
-            bot.send_message(
-                ADMIN_ID,
-                f"⚠️ Бот упал с ошибкой:\n\n<pre>{e}</pre>",
-                parse_mode="HTML",
-            )
-        except Exception:
-            # если бот не может даже отправить сообщение — записываем в лог
-            logging.error("Не удалось уведомить админа:\n%s", traceback.format_exc())
-
-        print(f"Ошибка polling: {e}")
-        print("Бот завершил работу. Docker перезапустит контейнер.")
-        time.sleep(5)  # небольшая пауза перед выходом
+    logger.info("Бот запущен. Активных пользователей: %d", len(users))
+    run_polling()
