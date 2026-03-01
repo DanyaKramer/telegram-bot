@@ -12,6 +12,9 @@ from telebot import apihelper
 import os
 from datetime import datetime
 from requests import exceptions as req_exceptions
+import re
+
+from mpt_schedule_client import MptScheduleClient
 
 # --- Глобальные переменные ---
 task = BackgroundScheduler()
@@ -19,10 +22,43 @@ bot = telebot.TeleBot(config.token)
 users = set()
 
 # Кэш для быстрых ответов
-cache = {"date": "Дата не загружена", "replacements": "Данных пока нет"}
+cache = {
+    "date": "Дата не загружена",
+    "replacements": "Данных пока нет",
+    "replacements_map": {},
+    "schedule_by_day": {},
+}
+
+GROUP_QUERY = "СА-1-23; СА-11/1-24"
+WEEK_DAYS = {
+    "понедельник": "Понедельник",
+    "вторник": "Вторник",
+    "среда": "Среда",
+    "четверг": "Четверг",
+    "пятница": "Пятница",
+    "суббота": "Суббота",
+}
+
+
+def resolve_log_file_path():
+    candidates = [
+        os.path.join("/app", "logs", "bot_errors.log"),
+        os.path.join(os.getcwd(), "logs", "bot_errors.log"),
+    ]
+    for path in candidates:
+        directory = os.path.dirname(path)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return "bot_errors.log"
+
+
+LOG_FILE_PATH = resolve_log_file_path()
 
 logging.basicConfig(
-    filename="/app/logs/bot_errors.log",
+    filename=LOG_FILE_PATH,
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
@@ -87,7 +123,7 @@ def admin_commands(message):
         handle_text(message)
 
     elif message.text == "📂 Скачать лог":
-        log_path = "/app/logs/bot_errors.log"
+        log_path = LOG_FILE_PATH
         if os.path.exists(log_path):
             with open(log_path, "rb") as log_file:
                 bot.send_document(message.chat.id, log_file)
@@ -184,6 +220,101 @@ def get_replacements(soup, target_text="СА-1-23"):
     return "\n".join(result) if result else "Возможно замен нет"
 
 
+def get_replacements_map(soup, target_text="СА-1-23"):
+    """Возвращает словарь замен в формате {номер_пары: текст_замены}."""
+    groups = soup.find_all('div', class_='table-responsive')
+    replacements_map = {}
+
+    for group in groups:
+        if target_text.lower() not in group.text.lower():
+            continue
+
+        table = group.find('table')
+        if not table:
+            continue
+
+        for row in table.find_all('tr'):
+            cells = row.find_all('td')
+            if len(cells) < 3:
+                continue
+
+            lesson = cells[0].text.strip()
+            replaced = cells[1].text.strip()
+            replacement = cells[2].text.strip()
+
+            match = re.search(r"\d+", lesson)
+            if not match:
+                continue
+
+            lesson_number = match.group(0)
+            replacements_map[lesson_number] = f"{replaced} → {replacement}"
+
+    return replacements_map
+
+
+def parse_schedule_by_day(section_text):
+    """Разбирает текст расписания группы и возвращает словарь по дням недели."""
+    schedule = {day: [] for day in WEEK_DAYS}
+    current_day = None
+
+    for raw_line in section_text.splitlines():
+        line = " ".join(raw_line.split())
+        if not line:
+            continue
+
+        day_match = re.match(
+            r'^(понедельник|вторник|среда|четверг|пятница|суббота)\b[\s:,-]*(.*)$',
+            line,
+            flags=re.IGNORECASE,
+        )
+        if day_match:
+            current_day = day_match.group(1).lower()
+            rest = day_match.group(2).strip()
+            if rest:
+                schedule[current_day].append(rest)
+            continue
+
+        if current_day:
+            schedule[current_day].append(line)
+
+    return schedule
+
+
+def load_group_schedule(group_query=GROUP_QUERY):
+    """Загружает расписание выбранной группы и возвращает словарь по дням."""
+    client = MptScheduleClient()
+    soup = client.fetch_page()
+    targets = client.collect_anchors(soup)
+    group = client.find_target(targets, group_query)
+    if not group:
+        return {day: [] for day in WEEK_DAYS}
+
+    section_text = client.extract_section_text(soup, group.anchor_id)
+    if not section_text:
+        return {day: [] for day in WEEK_DAYS}
+
+    return parse_schedule_by_day(section_text)
+
+
+def build_day_schedule_message(day_key):
+    day_title = WEEK_DAYS[day_key]
+    lessons = cache.get("schedule_by_day", {}).get(day_key, [])
+
+    if not lessons:
+        return f"📅 {day_title}\n\nВ этот день пар нет, выходной 🎉"
+
+    replacements_map = cache.get("replacements_map", {})
+    lines = [f"📅 {day_title}"]
+    for lesson in lessons:
+        match = re.search(r"\b(\d+)\b", lesson)
+        replacement_text = ""
+        if match and match.group(1) in replacements_map:
+            replacement_text = f" ↪ Замена: {replacements_map[match.group(1)]}"
+        lines.append(f"• {lesson}{replacement_text}")
+
+    return "\n".join(lines)
+
+
 def parsing_dates(soup):
     """Возвращаем дату изменений"""
     date_tag = soup.find('h4')
@@ -197,6 +328,8 @@ def update_cache():
         soup = fetch_page()
         cache["date"] = parsing_dates(soup)
         cache["replacements"] = get_replacements(soup)
+        cache["replacements_map"] = get_replacements_map(soup)
+        cache["schedule_by_day"] = load_group_schedule()
         logger.info("Кэш обновлён: %s", cache["date"])
     except Exception as e:
         logger.error("Ошибка обновления кэша: %s", e, exc_info=True)
@@ -209,6 +342,7 @@ def start(message):
     save_users()
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("Изменения в расписании"))
+    markup.add(types.KeyboardButton("📅 Расписание по дням"))
     bot.send_message(
         message.chat.id,
         text=f"Привет, {message.from_user.first_name}! "
@@ -221,6 +355,24 @@ def start(message):
 def handle_text(message):
     if message.text == "Изменения в расписании":
         bot.send_message(message.chat.id, f"{cache['date']}\n{cache['replacements']}")
+    elif message.text == "📅 Расписание по дням":
+        day_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
+        day_markup.add(
+            types.KeyboardButton("Понедельник"),
+            types.KeyboardButton("Вторник"),
+            types.KeyboardButton("Среда"),
+            types.KeyboardButton("Четверг"),
+            types.KeyboardButton("Пятница"),
+            types.KeyboardButton("Суббота"),
+        )
+        bot.send_message(
+            message.chat.id,
+            "Выберите день недели, чтобы посмотреть расписание:",
+            reply_markup=day_markup,
+        )
+    elif message.text and message.text.lower() in WEEK_DAYS:
+        day_key = message.text.lower()
+        bot.send_message(message.chat.id, build_day_schedule_message(day_key))
 
 
 # --- Проверка изменений и уведомления ---
