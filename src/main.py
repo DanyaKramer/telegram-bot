@@ -40,7 +40,7 @@ WEEK_DAYS = {
 }
 
 logging.basicConfig(
-    filename="/app/logs/bot_errors.log",
+    filename=LOG_FILE_PATH,
     level=logging.ERROR,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
@@ -105,7 +105,7 @@ def admin_commands(message):
         handle_text(message)
 
     elif message.text == "📂 Скачать лог":
-        log_path = "/app/logs/bot_errors.log"
+        log_path = LOG_FILE_PATH
         if os.path.exists(log_path):
             with open(log_path, "rb") as log_file:
                 bot.send_document(message.chat.id, log_file)
