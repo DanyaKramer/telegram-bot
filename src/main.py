@@ -39,24 +39,6 @@ WEEK_DAYS = {
     "суббота": "Суббота",
 }
 
-
-def resolve_log_file_path():
-    candidates = [
-        os.path.join("/app", "logs", "bot_errors.log"),
-        os.path.join(os.getcwd(), "logs", "bot_errors.log"),
-    ]
-    for path in candidates:
-        directory = os.path.dirname(path)
-        try:
-            os.makedirs(directory, exist_ok=True)
-            return path
-        except OSError:
-            continue
-    return "bot_errors.log"
-
-
-LOG_FILE_PATH = resolve_log_file_path()
-
 logging.basicConfig(
     filename=LOG_FILE_PATH,
     level=logging.ERROR,
