@@ -11,6 +11,7 @@ import time
 from telebot import apihelper
 import os
 from datetime import datetime
+from copy import deepcopy
 from requests import exceptions as req_exceptions
 import re
 
@@ -27,6 +28,8 @@ cache = {
     "replacements": "Данных пока нет",
     "replacements_map": {},
     "schedule_by_day": {},
+    "day_messages": {},
+    "last_cache_update": None,
 }
 
 GROUP_QUERY = "СА-1-23; СА-11/1-24"
@@ -38,6 +41,28 @@ WEEK_DAYS = {
     "пятница": "Пятница",
     "суббота": "Суббота",
 }
+
+CACHE_FILE_PATH = os.path.join(os.getcwd(), "cache_data.json")
+SCHEDULE_CACHE_TTL_SECONDS = 600
+
+
+
+def resolve_log_file_path():
+    candidates = [
+        os.path.join("/app", "logs", "bot_errors.log"),
+        os.path.join(os.getcwd(), "logs", "bot_errors.log"),
+    ]
+    for path in candidates:
+        directory = os.path.dirname(path)
+        try:
+            os.makedirs(directory, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return "bot_errors.log"
+
+
+LOG_FILE_PATH = resolve_log_file_path()
 
 logging.basicConfig(
     filename=LOG_FILE_PATH,
@@ -84,7 +109,7 @@ def admin_commands(message):
             bot.send_message(message.chat.id, f"👥 Пользователи ({len(users)}):\n{text}")
 
     elif message.text == "🔄 Обновить кэш":
-        update_cache()
+        update_cache(force_schedule_refresh=True)
         bot.send_message(message.chat.id, "✅ Кэш расписания обновлён вручную.")
 
     elif message.text == "🧹 Очистить пользователей":
@@ -165,9 +190,49 @@ def load_users():
         users = set()
 
 
+def save_cache_to_disk():
+    payload = {
+        "date": cache.get("date"),
+        "replacements": cache.get("replacements"),
+        "replacements_map": cache.get("replacements_map", {}),
+        "schedule_by_day": cache.get("schedule_by_day", {}),
+        "day_messages": cache.get("day_messages", {}),
+        "last_cache_update": cache.get("last_cache_update"),
+    }
+    with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def load_cache_from_disk():
+    if not os.path.exists(CACHE_FILE_PATH):
+        logger.info("Файл кэша не найден: %s", CACHE_FILE_PATH)
+        return
+    try:
+        with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+
+        cache["date"] = payload.get("date", cache["date"])
+        cache["replacements"] = payload.get("replacements", cache["replacements"])
+        cache["replacements_map"] = payload.get("replacements_map", {})
+        cache["schedule_by_day"] = payload.get("schedule_by_day", {})
+        cache["day_messages"] = payload.get("day_messages", {})
+        cache["last_cache_update"] = payload.get("last_cache_update")
+        logger.info("Кэш загружен с диска: %s", CACHE_FILE_PATH)
+    except Exception as e:
+        logger.error("Не удалось загрузить кэш с диска: %s", e, exc_info=True)
+
+
+def build_day_message_cache():
+    day_messages = {}
+    for day_key in WEEK_DAYS:
+        day_messages[day_key] = build_day_schedule_message(day_key, persist=False)
+    cache["day_messages"] = day_messages
+
+
 # --- Загрузка и парсинг страницы ---
 def fetch_page():
-    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/').text
+    logger.info("Загрузка страницы замен...")
+    req = requests.get('https://mpt.ru/izmeneniya-v-raspisanii/', timeout=20).text
     return BeautifulSoup(req, 'lxml')
 
 
@@ -262,28 +327,47 @@ def parse_schedule_by_day(section_text):
     return schedule
 
 
-def load_group_schedule(group_query=GROUP_QUERY):
+def load_group_schedule(group_query=GROUP_QUERY, force_refresh=False):
     """Загружает расписание выбранной группы и возвращает словарь по дням."""
-    client = MptScheduleClient()
+    current_schedule = cache.get("schedule_by_day") or {}
+    if not force_refresh and current_schedule and cache.get("last_cache_update"):
+        age = time.time() - cache["last_cache_update"]
+        if age < SCHEDULE_CACHE_TTL_SECONDS:
+            logger.info("Используем кэш расписания (возраст %.1f сек)", age)
+            return deepcopy(current_schedule)
+
+    logger.info("Загружаем свежее расписание группы: %s", group_query)
+    client = MptScheduleClient(timeout=20)
     soup = client.fetch_page()
     targets = client.collect_anchors(soup)
     group = client.find_target(targets, group_query)
     if not group:
+        logger.warning("Группа не найдена в расписании: %s", group_query)
         return {day: [] for day in WEEK_DAYS}
 
     section_text = client.extract_section_text(soup, group.anchor_id)
     if not section_text:
+        logger.warning("Не удалось извлечь блок расписания для группы: %s", group_query)
         return {day: [] for day in WEEK_DAYS}
 
     return parse_schedule_by_day(section_text)
 
 
-def build_day_schedule_message(day_key):
+def build_day_schedule_message(day_key, persist=True):
+    if persist:
+        cached_message = cache.get("day_messages", {}).get(day_key)
+        if cached_message:
+            logger.info("Отдаём сообщение дня '%s' из кэша", day_key)
+            return cached_message
+
     day_title = WEEK_DAYS[day_key]
     lessons = cache.get("schedule_by_day", {}).get(day_key, [])
 
     if not lessons:
-        return f"📅 {day_title}\n\nВ этот день пар нет, выходной 🎉"
+        message = f"📅 {day_title}\n\nВ этот день пар нет, выходной 🎉"
+        if persist:
+            cache.setdefault("day_messages", {})[day_key] = message
+        return message
 
     replacements_map = cache.get("replacements_map", {})
     lines = [f"📅 {day_title}"]
@@ -294,7 +378,10 @@ def build_day_schedule_message(day_key):
             replacement_text = f" ↪ Замена: {replacements_map[match.group(1)]}"
         lines.append(f"• {lesson}{replacement_text}")
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    if persist:
+        cache.setdefault("day_messages", {})[day_key] = message
+    return message
 
 
 def parsing_dates(soup):
@@ -304,17 +391,48 @@ def parsing_dates(soup):
 
 
 # --- Обновление кэша ---
-def update_cache():
+def update_cache(force_schedule_refresh=True):
     global cache
+    started_at = time.perf_counter()
+    logger.info("Запуск update_cache(force_schedule_refresh=%s)", force_schedule_refresh)
+
     try:
+        t0 = time.perf_counter()
         soup = fetch_page()
+        logger.info("Страница замен загружена за %.2f сек", time.perf_counter() - t0)
+
+        t1 = time.perf_counter()
         cache["date"] = parsing_dates(soup)
         cache["replacements"] = get_replacements(soup)
         cache["replacements_map"] = get_replacements_map(soup)
-        cache["schedule_by_day"] = load_group_schedule()
-        logger.info("Кэш обновлён: %s", cache["date"])
+        logger.info(
+            "Замены обработаны за %.2f сек (записей: %d)",
+            time.perf_counter() - t1,
+            len(cache.get("replacements_map", {})),
+        )
     except Exception as e:
-        logger.error("Ошибка обновления кэша: %s", e, exc_info=True)
+        logger.error("Ошибка обновления раздела замен: %s", e, exc_info=True)
+
+    try:
+        t2 = time.perf_counter()
+        cache["schedule_by_day"] = load_group_schedule(force_refresh=force_schedule_refresh)
+        logger.info(
+            "Расписание по дням обработано за %.2f сек",
+            time.perf_counter() - t2,
+        )
+    except Exception as e:
+        logger.error("Ошибка обновления раздела расписания: %s", e, exc_info=True)
+
+    cache["last_cache_update"] = time.time()
+    build_day_message_cache()
+
+    try:
+        save_cache_to_disk()
+        logger.info("Кэш сохранён на диск: %s", CACHE_FILE_PATH)
+    except Exception as e:
+        logger.error("Ошибка сохранения кэша на диск: %s", e, exc_info=True)
+
+    logger.info("update_cache завершён за %.2f сек", time.perf_counter() - started_at)
 
 
 # --- Хэндлеры бота ---
@@ -335,8 +453,10 @@ def start(message):
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
+    started_at = time.perf_counter()
     if message.text == "Изменения в расписании":
         bot.send_message(message.chat.id, f"{cache['date']}\n{cache['replacements']}")
+        logger.info("Ответ на 'Изменения в расписании' за %.3f сек", time.perf_counter() - started_at)
     elif message.text == "📅 Расписание по дням":
         day_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
         day_markup.add(
@@ -352,9 +472,11 @@ def handle_text(message):
             "Выберите день недели, чтобы посмотреть расписание:",
             reply_markup=day_markup,
         )
+        logger.info("Показали кнопки дней за %.3f сек", time.perf_counter() - started_at)
     elif message.text and message.text.lower() in WEEK_DAYS:
         day_key = message.text.lower()
         bot.send_message(message.chat.id, build_day_schedule_message(day_key))
+        logger.info("Ответ по дню '%s' за %.3f сек", day_key, time.perf_counter() - started_at)
 
 
 # --- Проверка изменений и уведомления ---
@@ -385,8 +507,9 @@ def safe_send():
 task.add_job(safe_send, 'interval', minutes=20)
 task.start()
 
-# Первое обновление сразу
-update_cache()
+# Загружаем кэш с диска, затем пробуем обновить сетью
+load_cache_from_disk()
+update_cache(force_schedule_refresh=True)
 
 # --- Запуск бота ---
 def notify_admin(message_text):
