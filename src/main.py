@@ -8,12 +8,14 @@ import json
 import logging
 import traceback
 import time
+import threading
 from telebot import apihelper
 import os
 from datetime import datetime
 from copy import deepcopy
 from requests import exceptions as req_exceptions
 import re
+import html
 
 from mpt_schedule_client import MptScheduleClient
 
@@ -44,6 +46,31 @@ WEEK_DAYS = {
 
 CACHE_FILE_PATH = os.path.join(os.getcwd(), "cache_data.json")
 SCHEDULE_CACHE_TTL_SECONDS = 600
+# Время, после которого при новом запросе расписания отправляется новое сообщение вместо редактирования
+SCHEDULE_MESSAGE_TTL_SECONDS = 6 * 60  # 6 минут
+
+# Состояние сообщения расписания по чатам: chat_id -> {message_id, sent_at}
+schedule_message_state = {}
+
+# --- Rate limiting (защита от флуда) ---
+user_request_timestamps = {}  # user_id -> list of timestamps
+RATE_LIMIT_WINDOW_SEC = 10
+RATE_LIMIT_MAX_REQUESTS = 5
+
+
+def _check_rate_limit(user_id, chat_id, from_user):
+    """Возвращает True если лимит превышен (и отправляет сообщение), False если ок."""
+    now = time.time()
+    key = user_id or chat_id
+    if key not in user_request_timestamps:
+        user_request_timestamps[key] = []
+    ts_list = user_request_timestamps[key]
+    ts_list[:] = [t for t in ts_list if now - t < RATE_LIMIT_WINDOW_SEC]
+    if len(ts_list) >= RATE_LIMIT_MAX_REQUESTS:
+        bot.send_message(chat_id, "Пошел нахуй")
+        return True
+    ts_list.append(now)
+    return False
 
 
 
@@ -66,16 +93,94 @@ LOG_FILE_PATH = resolve_log_file_path()
 
 logging.basicConfig(
     filename=LOG_FILE_PATH,
-    level=logging.ERROR,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.DEBUG,
+    format="%(asctime)s [%(levelname)s] %(name)s %(message)s",
 )
 logger = logging.getLogger("bot")
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 if not logger.handlers:
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    console_handler.setLevel(logging.DEBUG)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s %(message)s"))
     logger.addHandler(console_handler)
+
+# --- Дебаг: логируем каждый входящий апдейт ---
+def debug_updates_listener(updates):
+    """Логируем входящие апдейты для отладки."""
+    for u in updates:
+        if hasattr(u, "message") and u.message:
+            m = u.message
+            logger.debug(
+                "[IN] chat_id=%s user_id=%s text=%r",
+                m.chat.id,
+                m.from_user.id if m.from_user else None,
+                getattr(m, "text", None) or "(no text)",
+            )
+
+
+# --- Inline-кнопки выбора дня (на сообщении) ---
+def get_schedule_days_inline_markup():
+    """Кнопки выбора дня недели на сообщении (inline)."""
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.row(
+        types.InlineKeyboardButton("Пн", callback_data="day:понедельник"),
+        types.InlineKeyboardButton("Вт", callback_data="day:вторник"),
+        types.InlineKeyboardButton("Ср", callback_data="day:среда"),
+    )
+    markup.row(
+        types.InlineKeyboardButton("Чт", callback_data="day:четверг"),
+        types.InlineKeyboardButton("Пт", callback_data="day:пятница"),
+        types.InlineKeyboardButton("Сб", callback_data="day:суббота"),
+    )
+    return markup
+
+
+def _send_or_edit_schedule(chat_id, text, message_id=None):
+    """
+    Отправляет или редактирует сообщение расписания.
+    Если есть недавнее сообщение (< TTL) — редактирует, иначе — отправляет новое.
+    """
+    global schedule_message_state
+    now = time.time()
+    state = schedule_message_state.get(chat_id)
+    ttl = SCHEDULE_MESSAGE_TTL_SECONDS
+
+    markup = get_schedule_days_inline_markup()
+
+    # Редактируем, если есть недавнее сообщение
+    if state and (now - state["sent_at"]) < ttl and state.get("message_id"):
+        try:
+            bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            schedule_message_state[chat_id] = {"message_id": state["message_id"], "sent_at": now}
+            logger.debug("[schedule] отредактировано сообщение chat_id=%s", chat_id)
+            return
+        except Exception as e:
+            err_str = str(e).lower()
+            if "message is not modified" in err_str or "message text is not modified" in err_str:
+                schedule_message_state[chat_id] = {"message_id": state["message_id"], "sent_at": now}
+                logger.debug("[schedule] контент не изменился, редактирование не требуется chat_id=%s", chat_id)
+                return
+            logger.warning("[schedule] не удалось отредактировать: %s", e)
+            # Fallback — отправим новое
+
+    # Отправляем новое сообщение
+    msg = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="HTML")
+    schedule_message_state[chat_id] = {"message_id": msg.message_id, "sent_at": now}
+    logger.debug("[schedule] отправлено новое сообщение chat_id=%s", chat_id)
+
+
+# --- Общая клавиатура главного меню ---
+def get_main_menu_markup():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("Изменения в расписании"))
+    markup.add(types.KeyboardButton("📅 Расписание по дням"))
+    return markup
 
 
 # Админское меню
@@ -101,6 +206,15 @@ def admin_menu(message):
 # Обработка кнопок админа
 @bot.message_handler(func=lambda message: message.chat.id == config.ADMIN_ID)
 def admin_commands(message):
+    logger.debug("[admin_commands] chat_id=%s text=%r", message.chat.id, message.text)
+
+    # ВАЖНО: /start перехватывался этим хэндлером и игнорировался (не было ветки для него).
+    # Теперь передаём /start в start().
+    if message.text and message.text.strip().lower() in ("/start", "start"):
+        logger.info("[admin_commands] делегируем /start в start() для chat_id=%s", message.chat.id)
+        start(message)
+        return
+
     if message.text == "📊 Список пользователей":
         if not users:
             bot.send_message(message.chat.id, "👥 Список пользователей пуст.")
@@ -129,6 +243,9 @@ def admin_commands(message):
     elif message.text == "Изменения в расписании":
         handle_text(message)
 
+    elif message.text == "📅 Расписание по дням":
+        _send_or_edit_schedule(message.chat.id, "Выберите день недели, чтобы посмотреть расписание:")
+
     elif message.text == "📂 Скачать лог":
         log_path = LOG_FILE_PATH
         if os.path.exists(log_path):
@@ -142,9 +259,11 @@ def admin_commands(message):
         bot.register_next_step_handler(msg, broadcast_message)
 
     elif message.text == "⬅️ Выйти из админ-меню":
-        markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        markup.add(types.KeyboardButton("Изменения в расписании"))
-        bot.send_message(message.chat.id, "↩️ Возврат в обычное меню.", reply_markup=markup)
+        bot.send_message(message.chat.id, "↩️ Возврат в обычное меню.", reply_markup=get_main_menu_markup())
+    else:
+        # Сообщение от админа не распознано — передаём в handle_text (например, дни недели)
+        logger.debug("[admin_commands] не админ-кнопка, передаём в handle_text: %r", message.text)
+        handle_text(message)
 
 
 
@@ -185,8 +304,9 @@ def load_users():
     global users
     try:
         with open("users.json", "r", encoding="utf-8") as f:
-            users = set(json.load(f))
-    except FileNotFoundError:
+            data = json.load(f)
+        users = set(data) if isinstance(data, list) else set()
+    except (FileNotFoundError, json.JSONDecodeError, TypeError):
         users = set()
 
 
@@ -215,7 +335,8 @@ def load_cache_from_disk():
         cache["replacements"] = payload.get("replacements", cache["replacements"])
         cache["replacements_map"] = payload.get("replacements_map", {})
         cache["schedule_by_day"] = payload.get("schedule_by_day", {})
-        cache["day_messages"] = payload.get("day_messages", {})
+        # day_messages не загружаем — формат мог измениться, они пересоберутся из schedule_by_day
+        cache["day_messages"] = {}
         cache["last_cache_update"] = payload.get("last_cache_update")
         logger.info("Кэш загружен с диска: %s", CACHE_FILE_PATH)
     except Exception as e:
@@ -299,6 +420,83 @@ def get_replacements_map(soup, target_text="СА-1-23"):
     return replacements_map
 
 
+# Известные корпуса/локации (для строки "Где пара: ...")
+KNOWN_LOCATIONS = {"нежинская", "нахимовский"}
+
+# Аббревиатуры длинных дисциплин (короткие — физкультура, иностранный язык — без аббревиатур)
+DISCIPLINE_ABBREVIATIONS = {
+    "безопасность компьютерных сетей": "БКС",
+    "настройка программного обеспечения сетевых устройств": "НПОСУ",
+    "организация, принципы построения и функционирования кс": "ОППиФКС",
+    "эксплуатация сетевой инфраструктуры": "ЭСИ",
+    "администрирование сетевых операционных систем": "АСОС",
+}
+# Дисциплины, для которых аббревиатуры не добавляем (lowercase для сравнения)
+DISCIPLINE_NO_ABBREV = {"физическая культура", "иностранный язык", "оператор связи"}
+
+
+def _subject_with_abbrev(subject):
+    """Добавляет аббревиатуру к длинной дисциплине, если нужно."""
+    if not subject or not subject.strip():
+        return subject
+    s = subject.strip()
+    low = s.lower()
+    # Пропускаем короткие (физкультура, иностранный язык)
+    for excl in DISCIPLINE_NO_ABBREV:
+        if excl in low:
+            return s
+    # Ищем совпадение в словаре аббревиатур
+    for full_name, abbrev in DISCIPLINE_ABBREVIATIONS.items():
+        if full_name in low:
+            return f"{s} ({abbrev})"
+    return s
+
+
+def parse_lessons_list(lessons):
+    """
+    Разбирает сырой список строк расписания на день.
+    Возвращает (location, pairs), где:
+    - location: строка "Нежинская", "Нахимовский" или None
+    - pairs: dict {1: (subject, teacher), 2: (...), ...}, пустые слоты не заполнены
+    """
+    location = None
+    pairs = {}
+    i = 0
+    headers = {"пара", "предмет", "преподаватель"}
+
+    while i < len(lessons):
+        item = lessons[i].strip()
+        low = item.lower()
+
+        # Пропускаем заголовки таблицы
+        if low in headers:
+            i += 1
+            continue
+
+        # Проверяем, является ли элемент локацией (до начала нумерации пар)
+        if low in KNOWN_LOCATIONS and not pairs and not re.match(r"^\d+$", item):
+            location = item
+            i += 1
+            continue
+
+        # Ищем блок "номер пары" -> "предмет" -> "преподаватель"
+        if re.match(r"^[1-8]$", item):
+            pair_num = int(item)
+            subject = lessons[i + 1].strip() if i + 1 < len(lessons) else "—"
+            teacher = lessons[i + 2].strip() if i + 2 < len(lessons) else "—"
+            if re.match(r"^[1-8]$", subject):
+                subject, teacher = "—", "—"
+            elif re.match(r"^[1-8]$", teacher):
+                teacher = "—"
+            pairs[pair_num] = (subject, teacher)
+            i += 3
+            continue
+
+        i += 1
+
+    return location, pairs
+
+
 def parse_schedule_by_day(section_text):
     """Разбирает текст расписания группы и возвращает словарь по дням недели."""
     schedule = {day: [] for day in WEEK_DAYS}
@@ -362,6 +560,7 @@ def build_day_schedule_message(day_key, persist=True):
 
     day_title = WEEK_DAYS[day_key]
     lessons = cache.get("schedule_by_day", {}).get(day_key, [])
+    replacements_map = cache.get("replacements_map", {})
 
     if not lessons:
         message = f"📅 {day_title}\n\nВ этот день пар нет, выходной 🎉"
@@ -369,14 +568,48 @@ def build_day_schedule_message(day_key, persist=True):
             cache.setdefault("day_messages", {})[day_key] = message
         return message
 
-    replacements_map = cache.get("replacements_map", {})
+    location, pairs = parse_lessons_list(lessons)
+
+    # Если день полностью из практик — показываем короткое сообщение
+    if pairs and all(s and s.strip().upper() == "ПРАКТИКА" for s, _ in pairs.values()):
+        message = f"📅 {day_title}\n\nПРАКТИКА | У кого то сегодня практика а у кого то выходной"
+        if persist:
+            cache.setdefault("day_messages", {})[day_key] = message
+        return message
+
+    max_pair = max(pairs.keys()) if pairs else 0
     lines = [f"📅 {day_title}"]
-    for lesson in lessons:
-        match = re.search(r"\b(\d+)\b", lesson)
-        replacement_text = ""
-        if match and match.group(1) in replacements_map:
-            replacement_text = f" ↪ Замена: {replacements_map[match.group(1)]}"
-        lines.append(f"• {lesson}{replacement_text}")
+    if location:
+        lines.append(f"\n📍 Где пара: {location}")
+    lines.append("")
+
+    replacement_day = _get_replacement_day()
+    for n in range(1, max_pair + 1):
+        if n in pairs:
+            subject, teacher = pairs[n]
+            subject = _subject_with_abbrev(subject or "—")
+            subj_escaped = html.escape(subject)
+            teach_escaped = html.escape(teacher or "—")
+
+            if (
+                replacement_day == day_key
+                and str(n) in replacements_map
+                and replacements_map[str(n)]
+            ):
+                # Замена: зачёркнутая пара → новая пара
+                repl_str = replacements_map[str(n)]
+                parts = repl_str.split(" → ", 1)
+                new_subject = _subject_with_abbrev(parts[1].strip()) if len(parts) > 1 else ""
+                new_subj_escaped = html.escape(new_subject) if new_subject else html.escape(repl_str)
+                line = (
+                    f"{n}. <s><b>{subj_escaped}</b> — <i>{teach_escaped}</i></s> "
+                    f"→ <b>{new_subj_escaped}</b>"
+                )
+            else:
+                line = f"{n}. <b>{subj_escaped}</b> — <i>{teach_escaped}</i>"
+        else:
+            line = f"{n}. —"
+        lines.append(line)
 
     message = "\n".join(lines)
     if persist:
@@ -388,6 +621,15 @@ def parsing_dates(soup):
     """Возвращаем дату изменений"""
     date_tag = soup.find('h4')
     return date_tag.text.strip() if date_tag else "Дата не найдена"
+
+
+def _get_replacement_day():
+    """Извлекает день недели замен из cache['date'] (напр. 'вторник' из 'Замены на 03.03.2026 (Вторник)')."""
+    date_str = cache.get("date") or ""
+    for day_key, day_title in WEEK_DAYS.items():
+        if day_title.lower() in date_str.lower() or day_key in date_str.lower():
+            return day_key
+    return None
 
 
 # --- Обновление кэша ---
@@ -438,45 +680,97 @@ def update_cache(force_schedule_refresh=True):
 # --- Хэндлеры бота ---
 @bot.message_handler(commands=['start'])
 def start(message):
-    users.add(message.chat.id)
-    save_users()
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("Изменения в расписании"))
-    markup.add(types.KeyboardButton("📅 Расписание по дням"))
-    bot.send_message(
-        message.chat.id,
-        text=f"Привет, {message.from_user.first_name}! "
-             f"Я бот, который покажет тебе расписание и изменения в нём.",
-        reply_markup=markup
-    )
+    logger.debug("[start] chat_id=%s", message.chat.id)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if _check_rate_limit(user_id, message.chat.id, message.from_user):
+        return
+    try:
+        users.add(message.chat.id)
+        save_users()
+        markup = get_main_menu_markup()
+        bot.send_message(
+            message.chat.id,
+            text=f"Привет, {(message.from_user.first_name if message.from_user else 'друг')}! "
+                 f"Я бот, который покажет тебе расписание и изменения в нём.",
+            reply_markup=markup
+        )
+        logger.info("[start] успешно отправлено приветствие chat_id=%s", message.chat.id)
+    except Exception as e:
+        logger.error("[start] ошибка chat_id=%s: %s", message.chat.id, e, exc_info=True)
+        raise
 
 
 @bot.message_handler(content_types=['text'])
 def handle_text(message):
     started_at = time.perf_counter()
+    logger.debug("[handle_text] chat_id=%s text=%r", message.chat.id, message.text)
+    user_id = message.from_user.id if message.from_user else message.chat.id
+    if _check_rate_limit(user_id, message.chat.id, message.from_user):
+        return
     if message.text == "Изменения в расписании":
-        bot.send_message(message.chat.id, f"{cache['date']}\n{cache['replacements']}")
-        logger.info("Ответ на 'Изменения в расписании' за %.3f сек", time.perf_counter() - started_at)
-    elif message.text == "📅 Расписание по дням":
-        day_markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
-        day_markup.add(
-            types.KeyboardButton("Понедельник"),
-            types.KeyboardButton("Вторник"),
-            types.KeyboardButton("Среда"),
-            types.KeyboardButton("Четверг"),
-            types.KeyboardButton("Пятница"),
-            types.KeyboardButton("Суббота"),
-        )
+        # Всегда прикладываем главное меню, чтобы кнопки были даже если /start не отработал
         bot.send_message(
             message.chat.id,
-            "Выберите день недели, чтобы посмотреть расписание:",
-            reply_markup=day_markup,
+            f"{cache['date']}\n{cache['replacements']}",
+            reply_markup=get_main_menu_markup(),
         )
-        logger.info("Показали кнопки дней за %.3f сек", time.perf_counter() - started_at)
-    elif message.text and message.text.lower() in WEEK_DAYS:
-        day_key = message.text.lower()
-        bot.send_message(message.chat.id, build_day_schedule_message(day_key))
-        logger.info("Ответ по дню '%s' за %.3f сек", day_key, time.perf_counter() - started_at)
+        logger.info(
+            "[handle_text] ответ 'Изменения в расписании' chat_id=%s за %.3f сек",
+            message.chat.id,
+            time.perf_counter() - started_at,
+        )
+    elif message.text == "📅 Расписание по дням":
+        _send_or_edit_schedule(message.chat.id, "Выберите день недели, чтобы посмотреть расписание:")
+        logger.info("Показали inline-кнопки дней chat_id=%s за %.3f сек", message.chat.id, time.perf_counter() - started_at)
+    else:
+        logger.debug("[handle_text] неизвестный текст, пропускаем: %r", message.text)
+
+
+# --- Обработка inline-кнопок выбора дня ---
+@bot.callback_query_handler(func=lambda call: call.data and call.data.startswith("day:"))
+def on_day_callback(call):
+    """Обработка нажатия inline-кнопки дня: редактируем сообщение вместо отправки нового."""
+    user_id = call.from_user.id if call.from_user else call.message.chat.id
+    if _check_rate_limit(user_id, call.message.chat.id, call.from_user):
+        bot.answer_callback_query(call.id)
+        return
+    day_key = call.data.replace("day:", "").strip()
+    if day_key not in WEEK_DAYS:
+        bot.answer_callback_query(call.id, text="Неизвестный день")
+        return
+
+    text = build_day_schedule_message(day_key)
+    markup = get_schedule_days_inline_markup()
+
+    try:
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text=text,
+            reply_markup=markup,
+            parse_mode="HTML",
+        )
+        schedule_message_state[call.message.chat.id] = {
+            "message_id": call.message.message_id,
+            "sent_at": time.time(),
+        }
+        logger.debug("[schedule] отредактировано по callback chat_id=%s день=%s", call.message.chat.id, day_key)
+    except Exception as e:
+        err_str = str(e).lower()
+        if "message is not modified" in err_str or "message text is not modified" in err_str:
+            schedule_message_state[call.message.chat.id] = {
+                "message_id": call.message.message_id,
+                "sent_at": time.time(),
+            }
+            logger.debug("[schedule] контент не изменился по callback chat_id=%s день=%s", call.message.chat.id, day_key)
+        else:
+            logger.warning("[schedule] ошибка редактирования по callback: %s", e)
+            msg = bot.send_message(call.message.chat.id, text, reply_markup=markup, parse_mode="HTML")
+            schedule_message_state[call.message.chat.id] = {
+                "message_id": msg.message_id,
+                "sent_at": time.time(),
+            }
+    bot.answer_callback_query(call.id)
 
 
 # --- Проверка изменений и уведомления ---
@@ -507,9 +801,20 @@ def safe_send():
 task.add_job(safe_send, 'interval', minutes=20)
 task.start()
 
-# Загружаем кэш с диска, затем пробуем обновить сетью
+# Загружаем кэш с диска сразу (быстро), а обновление в сеть — в фоне,
+# чтобы не блокировать запуск polling. Раньше update_cache() блокировал
+# до 30+ секунд и бот не отвечал на /start.
 load_cache_from_disk()
-update_cache(force_schedule_refresh=True)
+logger.info("Запуск update_cache в фоновом потоке (не блокируем старт)...")
+def _run_initial_cache_update():
+    try:
+        update_cache(force_schedule_refresh=True)
+        logger.info("Фоновое обновление кэша завершено.")
+    except Exception as e:
+        logger.error("Ошибка фонового обновления кэша при старте: %s", e, exc_info=True)
+
+_cache_thread = threading.Thread(target=_run_initial_cache_update, daemon=True)
+_cache_thread.start()
 
 # --- Запуск бота ---
 def notify_admin(message_text):
@@ -528,8 +833,13 @@ def notify_admin(message_text):
 
 
 def run_polling():
+    try:
+        bot.set_update_listener(debug_updates_listener)
+    except AttributeError:
+        logger.warning("set_update_listener недоступен в этой версии pyTelegramBotAPI")
     delay = 5
     max_delay = 300
+    logger.info("Polling запущен, бот готов принимать сообщения.")
     while True:
         try:
             logger.info("Запуск polling...")
